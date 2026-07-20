@@ -57,6 +57,12 @@ class Encoder(nn.Module):
         # 16x16 -> 8x8
         self.down4 = DownsampleBlock(256, 256)
 
+        # Residual refinement blocks
+        self.res1 = ResidualBlock(128)
+        self.res2 = ResidualBlock(256)
+        self.res3 = ResidualBlock(256)
+        self.res4 = ResidualBlock(256)
+
         # Bottleneck compression
         self.bottleneck = nn.Sequential(
             nn.Conv2d(
@@ -68,7 +74,6 @@ class Encoder(nn.Module):
             nn.Tanh(),
         )
 
-
     def forward(self, x):
 
         skips = []
@@ -79,35 +84,29 @@ class Encoder(nn.Module):
         # 64x128x128
         skips.append(x)
 
-
         # 128x64x64
         x = self.down1(x)
-        x = ResidualBlock(128)(x)
+        x = self.res1(x)
         skips.append(x)
-
 
         # 256x32x32
         x = self.down2(x)
-        x = ResidualBlock(256)(x)
+        x = self.res2(x)
         skips.append(x)
-
 
         # 256x16x16
         x = self.down3(x)
-        x = ResidualBlock(256)(x)
+        x = self.res3(x)
         skips.append(x)
-
 
         # 256x8x8
         x = self.down4(x)
-        x = ResidualBlock(256)(x)
-
+        x = self.res4(x)
 
         # 128x8x8 latent
         latent = self.bottleneck(x)
 
         return latent, skips
-
 
 
 if __name__ == "__main__":
@@ -125,18 +124,13 @@ if __name__ == "__main__":
 
     latent, skips = encoder(dummy)
 
-
     print("Input :", dummy.shape)
-
     print("Latent :", latent.shape)
 
     print("\nSkip features:")
 
     for i, skip in enumerate(skips):
-        print(
-            f"Skip {i+1}: {skip.shape}"
-        )
-
+        print(f"Skip {i+1}: {skip.shape}")
 
     assert latent.shape == (
         2,
