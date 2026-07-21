@@ -60,13 +60,23 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer,
 
         optimizer.zero_grad()
 
-        # Mixed precision: most ops run in float16 on GPU, roughly halving
-        # activation memory and speeding up training on T4/A100-class GPUs.
-        # This is what actually fixes the CUDA OOM at our current batch
-        # size/resolution — no-ops safely on CPU (use_amp=False there).
+        # Mixed precision: model forward pass runs in float16 on GPU,
+        # roughly halving activation memory and speeding up training on
+        # T4/A100-class GPUs. This is what actually fixes the CUDA OOM at
+        # our current batch size/resolution — no-ops safely on CPU
+        # (use_amp=False there).
         with autocast(device_type="cuda", enabled=use_amp):
             out = model(x)
-            losses = loss_fn(out, x)
+
+        # Loss computation is deliberately OUTSIDE autocast, in float32.
+        # MS-SSIM and the VGG perceptual loss involve pooling, small
+        # denominators, and log-like operations that are numerically
+        # fragile in float16 — this is a well-known mixed-precision
+        # pitfall. Running the loss in fp32 while the model forward stays
+        # in fp16 is standard practice and keeps both the speed/memory
+        # benefit and training stability.
+        out_fp32 = {k: v.float() for k, v in out.items()}
+        losses = loss_fn(out_fp32, x)
 
         scaler.scale(losses["total"]).backward()
 
