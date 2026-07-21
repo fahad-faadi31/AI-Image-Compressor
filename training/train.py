@@ -26,6 +26,7 @@ import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from src.model import CompressionAutoencoder
@@ -47,19 +48,28 @@ def get_device(preferred: str) -> str:
     return preferred
 
 
-def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer):
+def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer, scaler):
     model.train()
     running_totals = {}
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]")
+    use_amp = device == "cuda"
 
     for step, batch in enumerate(pbar):
         x = batch.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        out = model(x)
-        losses = loss_fn(out, x)
-        losses["total"].backward()
-        optimizer.step()
+
+        # Mixed precision: most ops run in float16 on GPU, roughly halving
+        # activation memory and speeding up training on T4/A100-class GPUs.
+        # This is what actually fixes the CUDA OOM at our current batch
+        # size/resolution — no-ops safely on CPU (use_amp=False there).
+        with autocast(device_type="cuda", enabled=use_amp):
+            out = model(x)
+            losses = loss_fn(out, x)
+
+        scaler.scale(losses["total"]).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         for k, v in losses.items():
             running_totals[k] = running_totals.get(k, 0.0) + v.item()
@@ -129,10 +139,11 @@ def main():
 
     checkpoint_dir = Path(train_cfg["checkpoint_dir"])
     writer = SummaryWriter(log_dir=train_cfg["log_dir"])
+    scaler = GradScaler(device="cuda", enabled=(device == "cuda"))
 
     for epoch in range(start_epoch, train_cfg["num_epochs"]):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, epoch, writer
+            model, train_loader, optimizer, loss_fn, device, epoch, writer, scaler
         )
         scheduler.step()
 

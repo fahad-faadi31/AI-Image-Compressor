@@ -22,7 +22,10 @@ dataset:
   name: "DIV2K"
   train_dir: "dataset/train"
   val_dir: "dataset/val"
-  crop_size: 256               # random crop size used during training
+  crop_size: 256               # random crop size used during training.
+                                # MUST be >= 160 — MS-SSIM in src/losses.py
+                                # does 5 internal downsampling scales and
+                                # will throw an assertion error below that.
   augmentation:
     horizontal_flip: true
     vertical_flip: false
@@ -30,13 +33,16 @@ dataset:
     color_jitter: true
 
 training:
-  batch_size: 16
+  batch_size: 8                # reduced from 16 — combined with AMP (mixed
+                                # precision) in training/train.py, this fits
+                                # comfortably on a 15GB T4 at 256x256 res.
+                                # If you still hit CUDA OOM, try 4 next.
   num_epochs: 100
   optimizer: "adamw"
   learning_rate: 0.0002
   lr_scheduler: "cosine"
   weight_decay: 0.00001
-  num_workers: 4
+  num_workers: 2                # matches Colab's suggested worker count
   device: "cuda"               # falls back to cpu automatically if unavailable
   checkpoint_dir: "checkpoints"
   log_dir: "logs"
