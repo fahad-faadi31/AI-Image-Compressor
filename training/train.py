@@ -48,7 +48,8 @@ def get_device(preferred: str) -> str:
     return preferred
 
 
-def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer, scaler):
+def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer,
+                     scaler, grad_clip_norm):
     model.train()
     running_totals = {}
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]")
@@ -68,6 +69,16 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch, writer, sc
             losses = loss_fn(out, x)
 
         scaler.scale(losses["total"]).backward()
+
+        # Gradient clipping: must unscale first when using AMP, since
+        # gradients are scaled up internally by GradScaler and clipping
+        # against the wrong magnitude would clip too aggressively (or not
+        # at all). This guards against the occasional large gradient spike
+        # that can otherwise destabilize training, particularly early on
+        # and particularly under mixed precision.
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -143,7 +154,8 @@ def main():
 
     for epoch in range(start_epoch, train_cfg["num_epochs"]):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, epoch, writer, scaler
+            model, train_loader, optimizer, loss_fn, device, epoch, writer,
+            scaler, train_cfg.get("grad_clip_norm", 1.0)
         )
         scheduler.step()
 

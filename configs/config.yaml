@@ -43,6 +43,9 @@ training:
   lr_scheduler: "cosine"
   weight_decay: 0.00001
   num_workers: 2                # matches Colab's suggested worker count
+  grad_clip_norm: 1.0           # max gradient norm; guards against
+                                 # instability, especially under mixed
+                                 # precision (see training/train.py)
   device: "cuda"               # falls back to cpu automatically if unavailable
   checkpoint_dir: "checkpoints"
   log_dir: "logs"

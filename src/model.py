@@ -24,8 +24,19 @@ class Quantizer(nn.Module):
     """Straight-through quantizer: rounds in forward, identity gradient in backward.
 
     Steps:
-        1. Bound the unconstrained encoder output to [-1, 1] with tanh —
-           quantization needs a fixed range to define discrete levels over.
+        0. GroupNorm the raw encoder output first. This is a stability fix:
+           without it, if the encoder's raw output magnitude grows large
+           (e.g. from a gradient spike early in training), tanh() saturates
+           toward +-1 almost everywhere, and its gradient (1 - tanh(z)^2)
+           collapses to near zero — which silently kills gradient flow back
+           into the encoder. Once that happens the latent codes freeze and
+           stop responding to the input image at all, even though the
+           decoder may still keep training. GroupNorm (not BatchNorm) is
+           used because it normalizes per-sample, so it behaves identically
+           whether we're training with batch_size=8 or serving one image at
+           a time in the API.
+        1. Bound the normalized output to [-1, 1] with tanh — quantization
+           needs a fixed range to define discrete levels over.
         2. Scale to [0, levels-1] and round to the nearest integer level.
         3. Straight-through trick: use the *rounded* value in the forward
            computation graph, but make its local gradient equal to the
@@ -35,13 +46,19 @@ class Quantizer(nn.Module):
            input range no matter how many bits we quantize to.
     """
 
-    def __init__(self, bits: int):
+    def __init__(self, bits: int, latent_channels: int):
         super().__init__()
         self.bits = bits
         self.levels = 2 ** bits
+        num_groups = min(8, latent_channels)
+        self.pre_quant_norm = nn.GroupNorm(num_groups, latent_channels)
+
+    def _bound(self, z: torch.Tensor) -> torch.Tensor:
+        z_normed = self.pre_quant_norm(z)
+        return torch.tanh(z_normed)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z_bounded = torch.tanh(z)
+        z_bounded = self._bound(z)
         scaled = (z_bounded + 1) / 2 * (self.levels - 1)
         rounded = torch.round(scaled)
         # Straight-through estimator: forward value = rounded,
@@ -54,7 +71,7 @@ class Quantizer(nn.Module):
     def get_codes(self, z: torch.Tensor) -> torch.Tensor:
         """Integer codes only, no gradient — what actually gets stored/sent
         over the wire at inference time (before entropy coding)."""
-        z_bounded = torch.tanh(z)
+        z_bounded = self._bound(z)
         scaled = (z_bounded + 1) / 2 * (self.levels - 1)
         return torch.round(scaled).to(torch.int32)
 
@@ -70,7 +87,8 @@ class CompressionAutoencoder(nn.Module):
             num_residual_blocks=m["num_residual_blocks"],
             use_attention=m["use_attention"],
         )
-        self.quantizer = Quantizer(bits=m["quantization_bits"])
+        self.quantizer = Quantizer(bits=m["quantization_bits"],
+                                    latent_channels=m["latent_channels"])
         self.decoder = Decoder(
             base_channels=m["base_channels"],
             latent_channels=m["latent_channels"],
