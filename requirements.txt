@@ -1,11 +1,27 @@
-torch>=2.0
-torchvision>=0.15
+# --- Core deep learning ---
+torch>=2.2.0
+torchvision>=0.17.0
 
-numpy
-Pillow
-matplotlib
-tqdm
-tensorboard
+# --- Image I/O & processing ---
+Pillow>=10.0.0
+numpy>=1.26.0
+opencv-python-headless>=4.9.0
 
-scikit-image
-opencv-python
+# --- Metrics ---
+scikit-image>=0.22.0          # SSIM
+pytorch-msssim>=1.0.0         # differentiable MS-SSIM for loss + eval
+lpips>=0.1.4                  # perceptual similarity (optional eval metric)
+
+# --- Training utilities ---
+pyyaml>=6.0
+tqdm>=4.66.0
+tensorboard>=2.16.0
+
+# --- API ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9       # required by FastAPI for file uploads
+pydantic>=2.6.0
+
+# --- Testing ---
+pytest>=8.0.0

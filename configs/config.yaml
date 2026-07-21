@@ -1,0 +1,56 @@
+# =========================================================
+# AI-Image-Compressor — central configuration
+# Every module (training, api, src) reads from this file
+# instead of hardcoding values, so we only ever change
+# hyperparameters in ONE place.
+# =========================================================
+
+model:
+  name: "conv_autoencoder_v1"
+  latent_channels: 32          # bottleneck depth — controls compression ratio
+  base_channels: 64            # channel width of first conv block
+  num_residual_blocks: 4       # per encoder/decoder stage
+  use_attention: true          # lightweight SE-style attention in bottleneck
+  quantization_bits: 8         # bits per latent value after quantization
+
+tiling:
+  tile_size: 256               # must match training crop_size
+  overlap: 16                  # px overlap between tiles, feathered on stitch
+  min_size_for_tiling: 512     # images smaller than this are processed whole
+
+dataset:
+  name: "DIV2K"
+  train_dir: "dataset/train"
+  val_dir: "dataset/val"
+  crop_size: 256               # random crop size used during training
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    random_rotation_deg: 10
+    color_jitter: true
+
+training:
+  batch_size: 16
+  num_epochs: 100
+  optimizer: "adamw"
+  learning_rate: 0.0002
+  lr_scheduler: "cosine"
+  weight_decay: 0.00001
+  num_workers: 4
+  device: "cuda"               # falls back to cpu automatically if unavailable
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_every_n_epochs: 5
+
+  loss_weights:
+    l1: 1.0
+    ms_ssim: 1.0
+    perceptual: 0.1
+    rate: 0.01                 # pressure on latent to stay small — this is
+                                # what makes it a *compressor* and not just
+                                # an image-blurring autoencoder
+
+inference:
+  default_output_format: "webp"
+  supported_formats: ["jpg", "jpeg", "png", "webp", "bmp", "tiff"]
+  max_image_dimension: 8000    # safety cap (8K), reject anything larger

@@ -1,210 +1,90 @@
 """
-U-Net style Decoder for AI Image Compression.
+Decoder network: (dequantized) latent -> reconstructed image.
 
-Input:
-    latent: 128 x 8 x 8
+Contract:
+    Input:  tensor of shape (B, latent_channels, H/8, W/8), float32.
+    Output: tensor of shape (B, 3, H, W), float32, values in [0, 1].
 
-Uses encoder skip connections:
+Architecture (mirrors Encoder in reverse):
+    Head:        1x1 conv, latent_channels -> base*4          (H/8, W/8)
+                 + residual blocks
+    Stage 1:     PixelShuffle upsample, base*4 -> base*4        (H/4, W/4)  + residual blocks
+    Stage 2:     PixelShuffle upsample, base*4 -> base*2        (H/2, W/2)  + residual blocks
+    Stage 3:     PixelShuffle upsample, base*2 -> base            (H,   W)    + residual blocks
+    Output:      3x3 conv, base -> 3, then Sigmoid to bound to [0, 1]
 
-    skip4: 256 x 16 x 16
-    skip3: 256 x 32 x 32
-    skip2: 128 x 64 x 64
-    skip1: 64  x 128 x 128
-
-Output:
-    3 x 128 x 128
+Why PixelShuffle instead of ConvTranspose2d: transposed convolutions have
+uneven kernel overlap that produces visible checkerboard artifacts —
+exactly the kind of reconstruction flaw a compression product can't have.
+PixelShuffle (sub-pixel convolution) rearranges channels into spatial
+resolution instead, avoiding that failure mode.
 """
 
 import torch
 import torch.nn as nn
 
-from src.blocks import ResidualBlock, UpsampleBlock
+from src.blocks import ResidualBlock
+
+
+class UpBlock(nn.Module):
+    """PixelShuffle-based 2x upsample followed by N residual blocks."""
+
+    def __init__(self, in_channels: int, out_channels: int, num_residual_blocks: int):
+        super().__init__()
+        # Conv expands channels by 4x so PixelShuffle(2) can trade that
+        # channel factor for a 2x spatial upsample: (C*4, H, W) -> (C, 2H, 2W)
+        self.expand = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=1)
+        self.shuffle = nn.PixelShuffle(upscale_factor=2)
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(out_channels) for _ in range(num_residual_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.expand(x)
+        x = self.shuffle(x)
+        x = self.res_blocks(x)
+        return x
 
 
 class Decoder(nn.Module):
-
-    def __init__(self):
+    def __init__(self, base_channels: int, latent_channels: int,
+                 num_residual_blocks: int):
         super().__init__()
 
-        # 128x8x8 -> 256x8x8
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(
-                128,
-                256,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.GroupNorm(16, 256),
-            nn.LeakyReLU(0.1, inplace=True),
+        # Mirrors Encoder's c1, c2, c3 in reverse
+        c1, c2, c3 = base_channels * 2, base_channels * 4, base_channels * 4
+
+        self.head = nn.Conv2d(latent_channels, c3, kernel_size=1)
+        self.head_res_blocks = nn.Sequential(
+            *[ResidualBlock(c3) for _ in range(num_residual_blocks)]
         )
 
+        self.stage1 = UpBlock(c3, c2, num_residual_blocks)
+        self.stage2 = UpBlock(c2, c1, num_residual_blocks)
+        self.stage3 = UpBlock(c1, base_channels, num_residual_blocks)
 
-        # 256x8x8 -> 256x16x16
-        self.up1 = UpsampleBlock(256, 256)
+        self.output_conv = nn.Conv2d(base_channels, 3, kernel_size=3, padding=1)
+        self.output_act = nn.Sigmoid()  # bounds output to [0, 1], matching dataset.py
 
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(
-                256 + 256,
-                256,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.GroupNorm(16, 256),
-            nn.LeakyReLU(0.1, inplace=True),
-            ResidualBlock(256),
-        )
-
-
-        # 256x16x16 -> 256x32x32
-        self.up2 = UpsampleBlock(256, 256)
-
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(
-                256 + 256,
-                256,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.GroupNorm(16, 256),
-            nn.LeakyReLU(0.1, inplace=True),
-            ResidualBlock(256),
-        )
-
-
-        # 256x32x32 -> 128x64x64
-        self.up3 = UpsampleBlock(256, 128)
-
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(
-                128 + 128,
-                128,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.GroupNorm(8, 128),
-            nn.LeakyReLU(0.1, inplace=True),
-            ResidualBlock(128),
-        )
-
-
-        # 128x64x64 -> 64x128x128
-        self.up4 = UpsampleBlock(128, 64)
-
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(
-                64 + 64,
-                64,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(0.1, inplace=True),
-            ResidualBlock(64),
-        )
-
-
-        # Final reconstruction layer
-        self.output = nn.Sequential(
-            nn.Conv2d(
-                64,
-                3,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.Sigmoid(),
-        )
-
-
-    def forward(self, latent, skips):
-
-        x = self.bottleneck(latent)
-
-
-        # skip4: 256x16x16
-        x = self.up1(x)
-
-        x = torch.cat(
-            [x, skips[3]],
-            dim=1,
-        )
-
-        x = self.conv1(x)
-
-
-        # skip3: 256x32x32
-        x = self.up2(x)
-
-        x = torch.cat(
-            [x, skips[2]],
-            dim=1,
-        )
-
-        x = self.conv2(x)
-
-
-        # skip2: 128x64x64
-        x = self.up3(x)
-
-        x = torch.cat(
-            [x, skips[1]],
-            dim=1,
-        )
-
-        x = self.conv3(x)
-
-
-        # skip1: 64x128x128
-        x = self.up4(x)
-
-        x = torch.cat(
-            [x, skips[0]],
-            dim=1,
-        )
-
-        x = self.conv4(x)
-
-
-        return self.output(x)
-
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.head(z)
+        x = self.head_res_blocks(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.output_conv(x)
+        x = self.output_act(x)
+        return x
 
 
 if __name__ == "__main__":
-
-    print("========== DECODER TEST ==========")
-
-    decoder = Decoder()
-
-    latent = torch.randn(
-        2,
-        128,
-        8,
-        8,
-    )
-
-    skips = [
-        torch.randn(2, 64, 128, 128),
-        torch.randn(2, 128, 64, 64),
-        torch.randn(2, 256, 32, 32),
-        torch.randn(2, 256, 16, 16),
-    ]
-
-
-    output = decoder(
-        latent,
-        skips,
-    )
-
-
-    print("Latent :", latent.shape)
-    print("Output :", output.shape)
-
-
-    assert output.shape == (
-        2,
-        3,
-        128,
-        128,
-    )
-
-    print("\nDecoder test passed.")
-    print("=================================")
+    # Quick shape check — run as a module from the project root:
+    #   python -m src.decoder
+    dec = Decoder(base_channels=64, latent_channels=32, num_residual_blocks=4)
+    dummy_latent = torch.rand(2, 32, 32, 32)
+    out = dec(dummy_latent)
+    print(f"Input:  {tuple(dummy_latent.shape)}")
+    print(f"Output: {tuple(out.shape)}  (expected: (2, 3, 256, 256))")
+    print(f"Output range: [{out.min():.3f}, {out.max():.3f}]  (expected within [0, 1])")
+    n_params = sum(p.numel() for p in dec.parameters())
+    print(f"Parameters: {n_params:,}")

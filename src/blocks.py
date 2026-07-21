@@ -1,225 +1,58 @@
 """
-Reusable CNN building blocks.
-
-Version 2.1
------------
-Improvements:
-- GroupNorm instead of BatchNorm
-- LeakyReLU activations
-- Residual blocks with normalization
-- Better training stability for image compression
+Shared network building blocks used by both Encoder and Decoder.
+Kept separate so we don't duplicate the same residual/attention code twice.
 """
 
 import torch
 import torch.nn as nn
 
 
-class ConvBlock(nn.Module):
-    """
-    Conv -> GroupNorm -> LeakyReLU
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        stride=1,
-        padding=1,
-    ):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                padding,
-                bias=False,
-            ),
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=out_channels,
-            ),
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
 class ResidualBlock(nn.Module):
-    """
-    Residual Block
+    """Standard pre-activation residual block, stride 1, channels unchanged.
 
-        x
-         │
-     Conv
-         │
-      GroupNorm
-         │
-     LeakyReLU
-         │
-     Conv
-         │
-      GroupNorm
-         │
-        +
-         │
-     LeakyReLU
-         │
-       Output
+    Using GroupNorm (not BatchNorm): compression models often run inference
+    with batch_size=1 (single image), where BatchNorm's running statistics
+    behave poorly. GroupNorm is batch-size independent.
     """
 
-    def __init__(self, channels):
+    def __init__(self, channels: int, num_groups: int = 8):
         super().__init__()
+        self.norm1 = nn.GroupNorm(num_groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU(inplace=True)
 
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=False,
-            ),
-
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=channels,
-            ),
-
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-
-            nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=False,
-            ),
-
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=channels,
-            ),
-        )
-
-        self.activation = nn.LeakyReLU(
-            negative_slope=0.1,
-            inplace=True,
-        )
-
-    def forward(self, x):
-
-        out = self.block(x)
-
-        out = out + x
-
-        out = self.activation(out)
-
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.conv1(self.act(self.norm1(x)))
+        out = self.conv2(self.act(self.norm2(out)))
+        return out + residual
 
 
-class DownsampleBlock(nn.Module):
-    """
-    Strided convolution with GroupNorm.
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention.
+
+    Cheap (a couple of small linear layers) — lets the model learn to
+    weight *which channels* matter most for a given image region, e.g.
+    prioritizing edge/texture channels over flat-color channels. This is
+    the "lightweight attention" from our design discussion, not full
+    self-attention.
     """
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
-
-        self.block = nn.Sequential(
-
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-                bias=False,
-            ),
-
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=out_channels,
-            ),
-
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
+        hidden = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid(),
         )
 
-    def forward(self, x):
-        return self.block(x)
-
-
-class UpsampleBlock(nn.Module):
-    """
-    Nearest Neighbor Upsampling
-    followed by Conv + GroupNorm + LeakyReLU.
-    """
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-
-        self.block = nn.Sequential(
-
-            nn.Upsample(
-                scale_factor=2,
-                mode="nearest",
-            ),
-
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=False,
-            ),
-
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=out_channels,
-            ),
-
-            nn.LeakyReLU(
-                negative_slope=0.1,
-                inplace=True,
-            ),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-if __name__ == "__main__":
-
-    x = torch.randn(2, 64, 32, 32)
-
-    print("Testing ResidualBlock...")
-    block = ResidualBlock(64)
-    y = block(x)
-    print("ResidualBlock:", y.shape)
-
-    print("Testing DownsampleBlock...")
-    down = DownsampleBlock(64, 128)
-    y = down(x)
-    print("Downsample:", y.shape)
-
-    print("Testing UpsampleBlock...")
-    up = UpsampleBlock(128, 64)
-    y = up(torch.randn(2, 128, 16, 16))
-    print("Upsample:", y.shape)
-
-    print("\nAll block tests passed successfully.")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        weights = self.pool(x).view(b, c)
+        weights = self.fc(weights).view(b, c, 1, 1)
+        return x * weights

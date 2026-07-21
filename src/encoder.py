@@ -1,143 +1,97 @@
 """
-U-Net style Encoder for AI Image Compression.
+Encoder network: image -> latent representation.
+
+Contract:
+    Input:  tensor of shape (B, 3, H, W), float32, values in [0, 1],
+            H and W must be divisible by 8 (3 downsampling stages).
+    Output: tensor of shape (B, latent_channels, H/8, W/8) (pre-quantization).
 
 Architecture:
-Input:
-    3 x 128 x 128
+    Stem:        3 -> base_channels                       (H,   W)
+    Stage 1:     stride-2 conv, base -> base*2             (H/2, W/2)  + residual blocks
+    Stage 2:     stride-2 conv, base*2 -> base*4            (H/4, W/4)  + residual blocks
+    Stage 3:     stride-2 conv, base*4 -> base*4             (H/8, W/8)  + residual blocks
+    Attention:   SE block (optional, config-driven)
+    Head:        1x1 conv, base*4 -> latent_channels
 
-Feature extraction:
-    64  x 128 x 128  -> skip 1
-    128 x 64  x 64   -> skip 2
-    256 x 32  x 32   -> skip 3
-    256 x 16  x 16   -> skip 4
-
-Bottleneck:
-    128 x 8 x 8
-
-The encoder returns:
-    latent, skips
-
-The skip features are passed to the decoder to preserve
-fine details and improve reconstruction quality.
+Why 3 stages / /8 downsampling specifically: matches tile_size=256 in
+configs/config.yaml giving a 32x32 latent grid per tile — small enough for
+real compression, large enough to preserve texture detail. If tile_size
+changes, this ratio stays the same since it's stride-based, not hardcoded
+to 256.
 """
 
 import torch
 import torch.nn as nn
 
-from src.blocks import ResidualBlock, DownsampleBlock
+from src.blocks import ResidualBlock, SEBlock
+
+
+class DownBlock(nn.Module):
+    """Stride-2 downsample followed by N residual blocks at the new width."""
+
+    def __init__(self, in_channels: int, out_channels: int, num_residual_blocks: int):
+        super().__init__()
+        self.downsample = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                                     stride=2, padding=1)
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(out_channels) for _ in range(num_residual_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.downsample(x)
+        x = self.res_blocks(x)
+        return x
 
 
 class Encoder(nn.Module):
-
-    def __init__(self):
+    def __init__(self, base_channels: int, latent_channels: int,
+                 num_residual_blocks: int, use_attention: bool):
         super().__init__()
 
-        # Initial feature extraction
-        self.initial = nn.Sequential(
-            nn.Conv2d(
-                3,
-                64,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-            ),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
+        self.stem = nn.Conv2d(3, base_channels, kernel_size=3, padding=1)
 
-        # 128x128 -> 64x64
-        self.down1 = DownsampleBlock(64, 128)
+        # Channel widths per stage: base -> base*2 -> base*4 -> base*4
+        # (widen for the first two downsamples, hold steady on the third —
+        # keeps parameter count reasonable while still growing capacity
+        # where spatial resolution, and thus signal, is highest)
+        c1, c2, c3 = base_channels * 2, base_channels * 4, base_channels * 4
 
-        # 64x64 -> 32x32
-        self.down2 = DownsampleBlock(128, 256)
+        self.stage1 = DownBlock(base_channels, c1, num_residual_blocks)
+        self.stage2 = DownBlock(c1, c2, num_residual_blocks)
+        self.stage3 = DownBlock(c2, c3, num_residual_blocks)
 
-        # 32x32 -> 16x16
-        self.down3 = DownsampleBlock(256, 256)
+        self.attention = SEBlock(c3) if use_attention else nn.Identity()
 
-        # 16x16 -> 8x8
-        self.down4 = DownsampleBlock(256, 256)
+        self.head = nn.Conv2d(c3, latent_channels, kernel_size=1)
 
-        # Residual refinement blocks
-        self.res1 = ResidualBlock(128)
-        self.res2 = ResidualBlock(256)
-        self.res3 = ResidualBlock(256)
-        self.res4 = ResidualBlock(256)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if h % 8 != 0 or w % 8 != 0:
+            raise ValueError(
+                f"Encoder input H and W must be divisible by 8, got ({h}, {w}). "
+                f"This should be guaranteed by src/tiling.py padding upstream."
+            )
 
-        # Bottleneck compression
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(
-                256,
-                128,
-                kernel_size=1,
-                stride=1,
-            ),
-            nn.Tanh(),
-        )
-
-    def forward(self, x):
-
-        skips = []
-
-        # 3x128x128
-        x = self.initial(x)
-
-        # 64x128x128
-        skips.append(x)
-
-        # 128x64x64
-        x = self.down1(x)
-        x = self.res1(x)
-        skips.append(x)
-
-        # 256x32x32
-        x = self.down2(x)
-        x = self.res2(x)
-        skips.append(x)
-
-        # 256x16x16
-        x = self.down3(x)
-        x = self.res3(x)
-        skips.append(x)
-
-        # 256x8x8
-        x = self.down4(x)
-        x = self.res4(x)
-
-        # 128x8x8 latent
-        latent = self.bottleneck(x)
-
-        return latent, skips
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.attention(x)
+        x = self.head(x)
+        return x
 
 
 if __name__ == "__main__":
-
-    print("========== ENCODER TEST ==========")
-
-    encoder = Encoder()
-
-    dummy = torch.randn(
-        2,
-        3,
-        128,
-        128,
-    )
-
-    latent, skips = encoder(dummy)
-
-    print("Input :", dummy.shape)
-    print("Latent :", latent.shape)
-
-    print("\nSkip features:")
-
-    for i, skip in enumerate(skips):
-        print(f"Skip {i+1}: {skip.shape}")
-
-    assert latent.shape == (
-        2,
-        128,
-        8,
-        8,
-    )
-
-    print("\nEncoder test passed.")
-    print("=================================")
+    # Quick shape check — run as a module from the project root:
+    #   python -m src.encoder
+    # (NOT `python src/encoder.py` — that breaks the `from src.blocks import`
+    # above, since src/ wouldn't be on the import path as a package)
+    enc = Encoder(base_channels=64, latent_channels=32,
+                   num_residual_blocks=4, use_attention=True)
+    dummy = torch.rand(2, 3, 256, 256)
+    out = enc(dummy)
+    print(f"Input:  {tuple(dummy.shape)}")
+    print(f"Output: {tuple(out.shape)}  (expected: (2, 32, 32, 32))")
+    n_params = sum(p.numel() for p in enc.parameters())
+    print(f"Parameters: {n_params:,}")

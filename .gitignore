@@ -10,22 +10,27 @@ __pycache__/
 # Training outputs
 checkpoints/
 runs/
+logs/
 visualizations/
 results/
-logs/
 
-# Dataset
-data/
+# Dataset — DIV2K images excluded, but keep the folder structure via .gitkeep
+dataset/train/*
+dataset/val/*
+!dataset/train/.gitkeep
+!dataset/val/.gitkeep
 
-# Model weights
+# Model weights / exported models
 *.pt
 *.pth
+models/*
+!models/.gitkeep
 
-# Compressed files
+# Compressed files (API output artifacts)
 *.bin
 *.aic
 
-# Images generated during testing
+# Images generated during local testing
 comparison.png
 reconstructed.png
 
@@ -33,5 +38,6 @@ reconstructed.png
 .DS_Store
 Thumbs.db
 
-# VS Code
+# Editors
 .vscode/
+.idea/

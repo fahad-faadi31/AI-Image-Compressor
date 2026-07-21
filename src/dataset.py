@@ -1,78 +1,173 @@
 """
-DIV2K Dataset for patch-based training.
+DIV2K Dataset and preprocessing/augmentation transforms.
 
-Design notes (see project discussion for full reasoning):
-- We store only file paths in __init__, not loaded images -- loading 800+ 2K-resolution
-  images into memory upfront would be slow to start and wasteful, since we only ever
-  need small random crops from each.
-- __getitem__ takes a *random* crop each time it's called, rather than a fixed
-  non-overlapping grid. With only ~800 training images, random cropping acts as
-  implicit data augmentation (the model effectively never sees the exact same input
-  twice across epochs) and avoids the model learning artificial patch-boundary
-  artifacts that a fixed grid would introduce.
-- Guard clause: if an image is smaller than crop_size in either dimension (shouldn't
-  happen with DIV2K, but real pipelines don't assume "it probably won't happen"), we
-  upscale it, preserving aspect ratio, until the smaller side reaches crop_size.
+Contract:
+    DIV2KDataset(root_dir, crop_size, augment=True) -> torch.utils.data.Dataset
+    __getitem__ returns a single tensor (3, crop_size, crop_size), float32, [0,1]
+    (autoencoders are self-supervised: input == target, no labels needed)
+
+Preprocessing steps:
+    - Load image with PIL, convert to RGB
+    - Random crop to `crop_size` (training) / center crop (validation, no augment)
+    - If the image is smaller than crop_size in either dimension (shouldn't
+      happen with DIV2K, but real-world safety net), reflect-pad first
+    - Augmentations (train only): horizontal flip, rotation, color jitter
+    - Normalize to [0, 1] (NOT ImageNet mean/std — we want raw pixel
+      reconstruction; ImageNet stats would bias toward classification
+      features we don't need here)
 """
 
-import os
-import random
-from PIL import Image
+from pathlib import Path
+
+import torch
 from torch.utils.data import Dataset
+from PIL import Image
+import torchvision.transforms.functional as TF
+from torchvision import transforms
 
-IMG_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-
-
-def list_image_paths(root_dir):
-    """Return a sorted list of image file paths in root_dir (non-recursive)."""
-    paths = [
-        os.path.join(root_dir, fname)
-        for fname in os.listdir(root_dir)
-        if fname.lower().endswith(IMG_EXTENSIONS)
-    ]
-    if len(paths) == 0:
-        raise FileNotFoundError(
-            f"No images found in '{root_dir}'. "
-            f"Did you place the DIV2K images there? See README.md."
-        )
-    return sorted(paths)
+# DIV2K images are large (~2K px), so random cropping many patches per
+# image per epoch is standard practice — otherwise 800 images is a tiny
+# dataset for a conv net.
+VALID_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 
 class DIV2KDataset(Dataset):
-    def __init__(self, image_paths, crop_size=128, transform=None):
-        """
-        Args:
-            image_paths (list[str]): paths to full-resolution DIV2K images.
-            crop_size (int): side length of the square random crop.
-            transform: a torchvision-style transform applied to the PIL crop
-                (augmentation + ToTensor). See transforms.py.
-        """
-        self.image_paths = image_paths
+    def __init__(self, root_dir: str, crop_size: int, augment: bool = True,
+                 augmentation_config: dict = None):
+        self.root_dir = Path(root_dir)
         self.crop_size = crop_size
-        self.transform = transform
+        self.augment = augment
 
-    def __len__(self):
-        # Note: this is the number of *source images*, not the number of unique
-        # patches -- because crops are random, "one epoch" here is a loose notion.
-        # This is standard practice for patch-based training.
+        # Defaults mirror configs/config.yaml -> dataset.augmentation
+        cfg = augmentation_config or {}
+        self.horizontal_flip = cfg.get("horizontal_flip", True)
+        self.vertical_flip = cfg.get("vertical_flip", False)
+        self.random_rotation_deg = cfg.get("random_rotation_deg", 0)
+        self.color_jitter = cfg.get("color_jitter", False)
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(
+                f"Dataset directory not found: {self.root_dir}. "
+                f"Did you copy DIV2K images into this folder?"
+            )
+
+        self.image_paths = sorted(
+            p for p in self.root_dir.iterdir()
+            if p.suffix.lower() in VALID_EXTENSIONS
+        )
+
+        if len(self.image_paths) == 0:
+            raise RuntimeError(
+                f"No images found in {self.root_dir}. Expected .png/.jpg files "
+                f"copied directly from DIV2K_train_HR or DIV2K_valid_HR."
+            )
+
+        self._jitter = transforms.ColorJitter(
+            brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+        ) if self.color_jitter else None
+
+    def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert("RGB")
-        width, height = img.size
-
-        # Guard: upscale (preserving aspect ratio) if image is smaller than crop_size.
-        if width < self.crop_size or height < self.crop_size:
-            scale = self.crop_size / min(width, height)
-            new_w, new_h = int(width * scale) + 1, int(height * scale) + 1
-            img = img.resize((new_w, new_h), Image.BICUBIC)
-            width, height = img.size
-
-        x = random.randint(0, width - self.crop_size)
-        y = random.randint(0, height - self.crop_size)
-        img = img.crop((x, y, x + self.crop_size, y + self.crop_size))
-
-        if self.transform:
-            img = self.transform(img)
-
+    def _load_image(self, idx: int) -> Image.Image:
+        path = self.image_paths[idx]
+        img = Image.open(path).convert("RGB")
         return img
+
+    def _pad_if_needed(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        pad_w = max(0, self.crop_size - w)
+        pad_h = max(0, self.crop_size - h)
+        if pad_w > 0 or pad_h > 0:
+            # reflect padding avoids introducing flat/black borders that
+            # would leak into the learned reconstruction
+            img = TF.pad(img, padding=[0, 0, pad_w, pad_h], padding_mode="reflect")
+        return img
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        img = self._load_image(idx)
+        img = self._pad_if_needed(img)
+
+        if self.augment:
+            # Random crop location differs every epoch -> effectively
+            # infinite unique training patches from 800 source images
+            i, j, h, w = transforms.RandomCrop.get_params(
+                img, output_size=(self.crop_size, self.crop_size)
+            )
+            img = TF.crop(img, i, j, h, w)
+
+            if self.horizontal_flip and torch.rand(1).item() < 0.5:
+                img = TF.hflip(img)
+            if self.vertical_flip and torch.rand(1).item() < 0.5:
+                img = TF.vflip(img)
+            if self.random_rotation_deg > 0:
+                angle = (torch.rand(1).item() * 2 - 1) * self.random_rotation_deg
+                # reflect fill avoids black corner artifacts from rotation
+                img = TF.rotate(img, angle, fill=0)
+                # rotation can reintroduce below-crop-size edges after
+                # black-corner crop; re-pad+crop defensively
+                img = self._pad_if_needed(img)
+                img = TF.center_crop(img, [self.crop_size, self.crop_size])
+            if self._jitter is not None:
+                img = self._jitter(img)
+        else:
+            # Validation: deterministic center crop, no augmentation —
+            # we want stable, comparable metrics epoch to epoch
+            img = TF.center_crop(img, [self.crop_size, self.crop_size])
+
+        tensor = TF.to_tensor(img)  # -> (3, H, W), float32, already scaled to [0,1]
+        return tensor
+
+
+def get_dataloaders(config: dict):
+    """
+    Builds train and val DataLoaders directly from the config dict
+    (configs/config.yaml). This is the single call training/train.py
+    needs to make — keeps train.py free of dataset construction details.
+    """
+    from torch.utils.data import DataLoader
+
+    ds_cfg = config["dataset"]
+    train_cfg = config["training"]
+
+    train_dataset = DIV2KDataset(
+        root_dir=ds_cfg["train_dir"],
+        crop_size=ds_cfg["crop_size"],
+        augment=True,
+        augmentation_config=ds_cfg["augmentation"],
+    )
+    val_dataset = DIV2KDataset(
+        root_dir=ds_cfg["val_dir"],
+        crop_size=ds_cfg["crop_size"],
+        augment=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        num_workers=train_cfg["num_workers"],
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=False,
+        num_workers=train_cfg["num_workers"],
+        pin_memory=True,
+    )
+    return train_loader, val_loader
+
+
+if __name__ == "__main__":
+    # Quick smoke test — run directly to sanity check your DIV2K copy:
+    #   python src/dataset.py
+    import sys
+
+    root = sys.argv[1] if len(sys.argv) > 1 else "dataset/train"
+    ds = DIV2KDataset(root_dir=root, crop_size=256, augment=True)
+    print(f"Found {len(ds)} images in {root}")
+    sample = ds[0]
+    print(f"Sample tensor shape: {tuple(sample.shape)}, "
+          f"dtype: {sample.dtype}, range: [{sample.min():.3f}, {sample.max():.3f}]")
